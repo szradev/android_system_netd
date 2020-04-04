@@ -106,6 +106,16 @@ class TrafficController {
                                        const std::vector<int32_t>& uids, FirewallRule rule,
                                        FirewallType type);
 
+    netdutils::Status addUidInterfaceBlacklist(const int ifBlacklistSlot, const int iface,
+                                               const std::vector<std::string>& appStrUids)
+                                               EXCLUDES(mMutex);
+    netdutils::Status removeUidInterfaceBlacklist(const int ifBlacklistSlot,
+                                                  const std::vector<std::string>& appStrUids)
+                                                  EXCLUDES(mMutex);
+
+    netdutils::Status updateUidOwnerMap(const std::vector<std::string>& appStrUids,
+                                        BandwidthController::IptJumpOp jumpHandling,
+                                        BandwidthController::IptOp op) EXCLUDES(mMutex);
     static const String16 DUMP_KEYWORD;
 
     int toggleUidOwnerMap(ChildChain chain, bool enable);
@@ -194,9 +204,41 @@ class TrafficController {
 
     std::unique_ptr<NetlinkListenerInterface> mSkDestroyListener;
 
-    bool ebpfSupported;
+    netdutils::Status removeRule(BpfMap<uint32_t, UidOwnerValue>& map, uint32_t uid,
+                                 UidOwnerMatchType match, uint32_t ifBlacklistSlot = 0)
+                                 REQUIRES(mMutex);
 
-    std::mutex mOwnerMatchMutex;
+    netdutils::Status addRule(BpfMap<uint32_t, UidOwnerValue>& map, uint32_t uid,
+                              UidOwnerMatchType match, uint32_t iif = 0,
+                              uint32_t ifBlacklistSlot = 0) REQUIRES(mMutex);
+
+    bpf::BpfLevel mBpfLevel;
+
+    // mMutex guards all accesses to mConfigurationMap, mUidOwnerMap, mUidPermissionMap,
+    // mStatsMapA, mStatsMapB and mPrivilegedUser. It is designed to solve the following
+    // problems:
+    // 1. Prevent concurrent access and modification to mConfigurationMap, mUidOwnerMap,
+    //    mUidPermissionMap, and mPrivilegedUser. These data members are controlled by netd but can
+    //    be modified from different threads. TrafficController provides several APIs directly
+    //    called by the binder RPC, and different binder threads can concurrently access these data
+    //    members mentioned above. Some of the data members such as mUidPermissionMap and
+    //    mPrivilegedUsers are also accessed from a different thread when tagging sockets or
+    //    setting the counterSet through FwmarkServer
+    // 2. Coordinate the deletion of uid stats in mStatsMapA and mStatsMapB. The system server
+    //    always call into netd to ask for a live stats map change before it pull and clean up the
+    //    stats from the inactive map. The mMutex will block netd from accessing the stats map when
+    //    the mConfigurationMap is updating the current stats map so netd will not accidentally
+    //    read the map that system_server is cleaning up.
+    std::mutex mMutex;
+
+    // The limit on the number of stats entries a uid can have in the per uid stats map.
+    // TrafficController will block that specific uid from tagging new sockets after the limit is
+    // reached.
+    const uint32_t mPerUidStatsEntriesLimit;
+
+    // The limit on the total number of stats entries in the per uid stats map. TrafficController
+    // will block all tagging requests after the limit is reached.
+    const uint32_t mTotalUidStatsEntriesLimit;
 
     netdutils::Status loadAndAttachProgram(bpf_attach_type type, const char* path, const char* name,
                                            base::unique_fd& cg_fd);

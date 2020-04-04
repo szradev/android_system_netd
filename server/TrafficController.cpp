@@ -71,6 +71,50 @@ using netdutils::status::ok;
 
 constexpr int kSockDiagMsgType = SOCK_DIAG_BY_FAMILY;
 constexpr int kSockDiagDoneMsgType = NLMSG_DONE;
+constexpr int PER_UID_STATS_ENTRIES_LIMIT = 500;
+// At most 90% of the stats map may be used by tagged traffic entries. This ensures
+// that 10% of the map is always available to count untagged traffic, one entry per UID.
+// Otherwise, apps would be able to avoid data usage accounting entirely by filling up the
+// map with tagged traffic entries.
+constexpr int TOTAL_UID_STATS_ENTRIES_LIMIT = STATS_MAP_SIZE * 0.9;
+
+static_assert(BPF_PERMISSION_INTERNET == INetd::PERMISSION_INTERNET,
+              "Mismatch between BPF and AIDL permissions: PERMISSION_INTERNET");
+static_assert(BPF_PERMISSION_UPDATE_DEVICE_STATS == INetd::PERMISSION_UPDATE_DEVICE_STATS,
+              "Mismatch between BPF and AIDL permissions: PERMISSION_UPDATE_DEVICE_STATS");
+static_assert(STATS_MAP_SIZE - TOTAL_UID_STATS_ENTRIES_LIMIT > 100,
+              "The limit for stats map is to high, stats data may be lost due to overflow");
+
+#define FLAG_MSG_TRANS(result, flag, value)            \
+    do {                                               \
+        if (value & flag) {                            \
+            result.append(StringPrintf(" %s", #flag)); \
+            value &= ~flag;                            \
+        }                                              \
+    } while (0)
+
+const std::string uidMatchTypeToString(uint8_t match) {
+    std::string matchType;
+    FLAG_MSG_TRANS(matchType, HAPPY_BOX_MATCH, match);
+    FLAG_MSG_TRANS(matchType, PENALTY_BOX_MATCH, match);
+    FLAG_MSG_TRANS(matchType, DOZABLE_MATCH, match);
+    FLAG_MSG_TRANS(matchType, STANDBY_MATCH, match);
+    FLAG_MSG_TRANS(matchType, POWERSAVE_MATCH, match);
+    FLAG_MSG_TRANS(matchType, IIF_MATCH, match);
+    FLAG_MSG_TRANS(matchType, IF_BLACKLIST, match);
+    if (match) {
+        return StringPrintf("Unknown match: %u", match);
+    }
+    return matchType;
+}
+
+bool TrafficController::hasUpdateDeviceStatsPermission(uid_t uid) {
+    // This implementation is the same logic as method ActivityManager#checkComponentPermission.
+    // It implies that the calling uid can never be the same as PER_USER_RANGE.
+    uint32_t appId = uid % PER_USER_RANGE;
+    return ((appId == AID_ROOT) || (appId == AID_SYSTEM) ||
+            mPrivilegedUser.find(appId) != mPrivilegedUser.end());
+}
 
 StatusOr<std::unique_ptr<NetlinkListenerInterface>> makeSkDestroyListener() {
     const auto& sys = sSyscalls.get();
@@ -453,7 +497,120 @@ Status TrafficController::updateOwnerMapEntry(BpfMap<uint32_t, uint8_t>& map, ui
         RETURN_IF_NOT_OK(map.deleteValue(uid));
     } else {
         //Cannot happen.
-        return statusFromErrno(-EINVAL, "");
+        return statusFromErrno(EINVAL, "");
+    }
+    return netdutils::status::ok;
+}
+
+UidOwnerMatchType TrafficController::jumpOpToMatch(BandwidthController::IptJumpOp jumpHandling) {
+    switch (jumpHandling) {
+        case BandwidthController::IptJumpReject:
+            return PENALTY_BOX_MATCH;
+        case BandwidthController::IptJumpReturn:
+            return HAPPY_BOX_MATCH;
+        case BandwidthController::IptJumpNoAdd:
+            return NO_MATCH;
+    }
+}
+
+Status TrafficController::removeRule(BpfMap<uint32_t, UidOwnerValue>& map, uint32_t uid,
+                                     UidOwnerMatchType match, uint32_t ifBlacklistSlot) {
+    if (match & IF_BLACKLIST && ifBlacklistSlot >= UID_MAX_IF_BLACKLIST) {
+        return statusFromErrno(EINVAL, StringPrintf("Interface rule iface slot is out of range: %d",
+                                                    ifBlacklistSlot));
+    }
+    auto oldMatch = map.readValue(uid);
+    if (isOk(oldMatch)) {
+        UidOwnerValue newMatch = {.rule = static_cast<uint8_t>(oldMatch.value().rule & ~match),
+                                  .iif = (match == IIF_MATCH) ? 0 : oldMatch.value().iif};
+        // Copy previous set of blacklisted interfaces
+        memcpy(newMatch.if_blacklist, oldMatch.value().if_blacklist, sizeof(newMatch.if_blacklist));
+        // If this is a remove blacklisted interface call, clear the slot requested.
+        if (match & IF_BLACKLIST) {
+            newMatch.if_blacklist[ifBlacklistSlot] = 0;
+            // Check if any IF_BLACKLIST interfaces remain
+            for (int i = 0; i < UID_MAX_IF_BLACKLIST; i++) {
+                if (newMatch.if_blacklist[i] > 0) {
+                    newMatch.rule |= IF_BLACKLIST;
+                    break;
+                }
+            }
+        }
+        if (newMatch.rule == 0) {
+            RETURN_IF_NOT_OK(map.deleteValue(uid));
+        } else {
+            RETURN_IF_NOT_OK(map.writeValue(uid, newMatch, BPF_ANY));
+        }
+    } else {
+        return statusFromErrno(ENOENT, StringPrintf("uid: %u does not exist in map", uid));
+    }
+    return netdutils::status::ok;
+}
+
+Status TrafficController::addRule(BpfMap<uint32_t, UidOwnerValue>& map, uint32_t uid,
+                                  UidOwnerMatchType match, uint32_t iif, uint32_t ifBlacklistSlot) {
+    if ((match & IIF_MATCH) && (match & IF_BLACKLIST)) {
+        return statusFromErrno(EINVAL, "Cannot match on IIF_MATCH and IF_BLACKLIST in the "
+                                       "same addRule call");
+    }
+    if ((match & IF_BLACKLIST) && ifBlacklistSlot >= UID_MAX_IF_BLACKLIST) {
+        return statusFromErrno(EINVAL, StringPrintf("Interface rule iface slot is out of range: %d",
+                                                    ifBlacklistSlot));
+    }
+
+    // iif should be non-zero if and only if match & (IIF_MATCH | IF_BLACKLIST)
+    if ((match & (IIF_MATCH | IF_BLACKLIST)) && iif == 0) {
+        return statusFromErrno(EINVAL, "Interface match must have nonzero interface index");
+    } else if (!(match & (IIF_MATCH | IF_BLACKLIST)) && iif != 0) {
+        return statusFromErrno(EINVAL, "Non-interface match must have zero interface index");
+    }
+    auto oldMatch = map.readValue(uid);
+    UidOwnerValue newMatch;
+    if (isOk(oldMatch)) {
+        newMatch = {.rule = static_cast<uint8_t>(oldMatch.value().rule | match),
+                    .iif = oldMatch.value().iif};
+        // Copy previous set of blacklisted interfaces
+        memcpy(newMatch.if_blacklist, oldMatch.value().if_blacklist, sizeof(newMatch.if_blacklist));
+    } else {
+        newMatch = {.rule = static_cast<uint8_t>(match), .iif = iif};
+        for (int i = 0; i < UID_MAX_IF_BLACKLIST; i++) {
+            newMatch.if_blacklist[i] = 0;
+        }
+    }
+    if (match & IIF_MATCH) {
+        newMatch.iif = iif;
+    } else if (match & IF_BLACKLIST) {
+        newMatch.if_blacklist[ifBlacklistSlot] = iif;
+    }
+    RETURN_IF_NOT_OK(map.writeValue(uid, newMatch, BPF_ANY));
+    return netdutils::status::ok;
+}
+
+Status TrafficController::updateUidOwnerMap(const std::vector<std::string>& appStrUids,
+                                            BandwidthController::IptJumpOp jumpHandling,
+                                            BandwidthController::IptOp op) {
+    std::lock_guard guard(mMutex);
+    UidOwnerMatchType match = jumpOpToMatch(jumpHandling);
+    if (match == NO_MATCH) {
+        return statusFromErrno(
+                EINVAL, StringPrintf("invalid IptJumpOp: %d, command: %d", jumpHandling, match));
+    }
+    for (const auto& appStrUid : appStrUids) {
+        char* endPtr;
+        long uid = strtol(appStrUid.c_str(), &endPtr, 10);
+        if ((errno == ERANGE && (uid == LONG_MAX || uid == LONG_MIN)) ||
+            (endPtr == appStrUid.c_str()) || (*endPtr != '\0')) {
+               return statusFromErrno(errno, "invalid uid string:" + appStrUid);
+        }
+
+        if (op == BandwidthController::IptOpDelete) {
+            RETURN_IF_NOT_OK(removeRule(mUidOwnerMap, uid, match));
+        } else if (op == BandwidthController::IptOpInsert) {
+            RETURN_IF_NOT_OK(addRule(mUidOwnerMap, uid, match));
+        } else {
+            // Cannot happen.
+            return statusFromErrno(EINVAL, StringPrintf("invalid IptOp: %d, %d", op, match));
+        }
     }
     return netdutils::status::ok;
 }
@@ -508,6 +665,47 @@ Status TrafficController::replaceUidsInMap(BpfMap<uint32_t, uint8_t>& map,
 
     for (auto uid : uids) {
         RETURN_IF_NOT_OK(updateOwnerMapEntry(map, uid, rule, type));
+    }
+    return netdutils::status::ok;
+}
+
+Status TrafficController::addUidInterfaceBlacklist(const int ifBlacklistSlot, const int iface,
+                                                   const std::vector<std::string>& appStrUids) {
+    if (mBpfLevel == BpfLevel::NONE) {
+        ALOGW("UID ingress interface filtering not possible without BPF owner match");
+        return statusFromErrno(EOPNOTSUPP, "eBPF not supported");
+    }
+    if (!iface) {
+        return statusFromErrno(EINVAL, "Interface rule must specify interface");
+    }
+    std::lock_guard guard(mMutex);
+
+    for (const auto& appStrUid : appStrUids) {
+        uint32_t uid = (uint32_t) std::stoi(appStrUid, nullptr, 0);
+        netdutils::Status result = addRule(mUidOwnerMap, uid, IF_BLACKLIST, iface, ifBlacklistSlot);
+        if (!isOk(result)) {
+            ALOGW("addRule failed(%d): uid=%d iface=%d ifBlacklistSlot=%d "
+                  "(addUidInterfaceBlacklist)", result.code(), uid, iface, ifBlacklistSlot);
+        }
+    }
+    return netdutils::status::ok;
+}
+
+Status TrafficController::removeUidInterfaceBlacklist(const int ifBlacklistSlot,
+                                                      const std::vector<std::string>& appStrUids) {
+    if (mBpfLevel == BpfLevel::NONE) {
+        ALOGW("UID ingress interface filtering not possible without BPF owner match");
+        return statusFromErrno(EOPNOTSUPP, "eBPF not supported");
+    }
+    std::lock_guard guard(mMutex);
+
+    for (const auto& appStrUid : appStrUids) {
+        uint32_t uid = (uint32_t) std::stoi(appStrUid, nullptr, 0);
+        netdutils::Status result = removeRule(mUidOwnerMap, uid, IF_BLACKLIST, ifBlacklistSlot);
+        if (!isOk(result)) {
+            ALOGW("removeRule failed(%d): uid=%d ifBlacklistSlot=%d (removeUidInterfaceBlacklist)",
+                  result.code(), uid, ifBlacklistSlot);
+        }
     }
     return netdutils::status::ok;
 }
