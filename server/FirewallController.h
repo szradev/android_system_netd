@@ -32,10 +32,14 @@ enum FirewallRule { DENY, ALLOW };
 
 enum FirewallType { WHITELIST, BLACKLIST };
 
-enum ChildChain { NONE, DOZABLE, STANDBY, POWERSAVE, INVALID_CHAIN };
-
-#define PROTOCOL_TCP 6
-#define PROTOCOL_UDP 17
+enum ChildChain {
+    NONE = INetd::FIREWALL_CHAIN_NONE,
+    DOZABLE = INetd::FIREWALL_CHAIN_DOZABLE,
+    STANDBY = INetd::FIREWALL_CHAIN_STANDBY,
+    POWERSAVE = INetd::FIREWALL_CHAIN_POWERSAVE,
+    ISOLATED = INetd::FIREWALL_CHAIN_ISOLATED,
+    INVALID_CHAIN
+};
 
 /*
  * Simple firewall that drops all packets except those matching explicitly
@@ -75,6 +79,7 @@ public:
     static const char* LOCAL_DOZABLE;
     static const char* LOCAL_STANDBY;
     static const char* LOCAL_POWERSAVE;
+    static const char* LOCAL_ISOLATED;
 
     static const char* ICMPV6_TYPES[];
 
